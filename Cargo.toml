@@ -1,0 +1,25 @@
+[package]
+name = "spira"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance hydrodynamic simulation of nasal sinus airflow using Lattice Boltzmann Method"
+license = "MIT"
+
+[dependencies]
+bevy = { version = "0.17", default-features = false, features = [
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_winit",
+    "x11",
+    "wayland",
+] }
+bytemuck = { version = "1.21", features = ["derive"] }
+noise = "0.9"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
