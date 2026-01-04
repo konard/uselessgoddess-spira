@@ -11,6 +11,7 @@
 mod physics;
 
 use bevy::{
+    ecs::message::MessageReader,
     input::mouse::MouseMotion,
     prelude::*,
     render::settings::{PowerPreference, RenderCreation, WgpuSettings},
@@ -205,7 +206,7 @@ fn switch_display_texture(
     // Toggle display texture every frame to show latest result
     for mut sprite in &mut sprites {
         let frame = (time.elapsed_secs() * 60.0) as u32;
-        if frame % 2 == 0 {
+        if frame.is_multiple_of(2) {
             sprite.image = textures.density_a.clone();
         } else {
             sprite.image = textures.density_b.clone();
@@ -218,8 +219,8 @@ fn camera_controller(
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
-    mut mouse_motion: EventReader<MouseMotion>,
-    mut mouse_wheel: EventReader<bevy::input::mouse::MouseWheel>,
+    mut mouse_motion: MessageReader<MouseMotion>,
+    mut mouse_wheel: MessageReader<bevy::input::mouse::MouseWheel>,
     mut camera: Query<(&mut Transform, &mut MainCamera)>,
     config: Option<Res<SimulationConfig>>,
 ) {

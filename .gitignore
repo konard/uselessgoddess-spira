@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Cargo lock file (optional for libraries, keep for binaries)
+# Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Debug files
+*.log
+*.pdb
+
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
