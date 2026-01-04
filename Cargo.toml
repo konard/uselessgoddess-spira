@@ -1,0 +1,22 @@
+[package]
+name = "spira"
+version = "0.1.0"
+edition = "2024"
+description = "High-performance dental fluid simulation using Lattice Boltzmann Method"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/uselessgoddess/spira"
+keywords = ["fluid-simulation", "medical", "gpu", "lbm", "bevy"]
+categories = ["simulation", "rendering", "science"]
+
+[dependencies]
+bevy = "0.17"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
