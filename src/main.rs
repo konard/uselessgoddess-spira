@@ -7,18 +7,18 @@ use bevy::{
     asset::RenderAssetUsages,
     prelude::*,
     render::{
+        Render, RenderApp, RenderSystems,
         extract_resource::{ExtractResource, ExtractResourcePlugin},
         render_graph::{self, RenderGraph, RenderLabel},
         render_resource::{
+            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
+            CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor, Extent3d,
+            PipelineCache, ShaderStages, StorageTextureAccess, TextureDimension, TextureFormat,
+            TextureUsages,
             binding_types::{texture_storage_3d, uniform_buffer},
             encase::ShaderType,
-            BindGroup, BindGroupEntries, BindGroupLayout, BindGroupLayoutEntries,
-            CachedComputePipelineId, ComputePassDescriptor, ComputePipelineDescriptor,
-            Extent3d, PipelineCache, ShaderStages, StorageTextureAccess, TextureDimension,
-            TextureFormat, TextureUsages,
         },
         renderer::{RenderContext, RenderDevice},
-        Render, RenderApp, RenderSystems,
     },
 };
 use bytemuck::{Pod, Zeroable};
@@ -156,8 +156,10 @@ fn create_3d_texture(
     format: TextureFormat,
 ) -> Handle<Image> {
     let bytes_per_pixel = format.block_copy_size(None).unwrap_or(4) as usize;
-    let data_size =
-        size.width as usize * size.height as usize * size.depth_or_array_layers as usize * bytes_per_pixel;
+    let data_size = size.width as usize
+        * size.height as usize
+        * size.depth_or_array_layers as usize
+        * bytes_per_pixel;
 
     let mut image = Image::new_fill(
         size,
@@ -212,7 +214,7 @@ fn generate_sinus_phantom(images: &mut Assets<Image>, geometry_handle: &Handle<I
                     || y >= size - 2;
 
                 // Create inlet/outlet channels at z boundaries
-                let channel_dist = ((nx * nx + ny * ny) as f64).sqrt();
+                let channel_dist = (nx * nx + ny * ny).sqrt();
                 let is_channel = channel_dist < 0.1 && (z < 4 || z >= size - 4);
 
                 data[idx] = if is_wall && !is_channel { 1 } else { 0 };
@@ -316,11 +318,14 @@ fn prepare_bind_groups(
     };
 
     // Create uniform buffer
-    let params_buffer = render_device.create_buffer_with_data(&bevy::render::render_resource::BufferInitDescriptor {
-        label: Some("lbm_params_buffer"),
-        contents: bytemuck::bytes_of(&*params),
-        usage: bevy::render::render_resource::BufferUsages::UNIFORM | bevy::render::render_resource::BufferUsages::COPY_DST,
-    });
+    let params_buffer = render_device.create_buffer_with_data(
+        &bevy::render::render_resource::BufferInitDescriptor {
+            label: Some("lbm_params_buffer"),
+            contents: bytemuck::bytes_of(&*params),
+            usage: bevy::render::render_resource::BufferUsages::UNIFORM
+                | bevy::render::render_resource::BufferUsages::COPY_DST,
+        },
+    );
 
     // Even step: read from f_in, write to f_out
     let even = render_device.create_bind_group(
@@ -336,11 +341,14 @@ fn prepare_bind_groups(
     );
 
     // Odd step: read from f_out, write to f_in
-    let params_buffer_odd = render_device.create_buffer_with_data(&bevy::render::render_resource::BufferInitDescriptor {
-        label: Some("lbm_params_buffer_odd"),
-        contents: bytemuck::bytes_of(&*params),
-        usage: bevy::render::render_resource::BufferUsages::UNIFORM | bevy::render::render_resource::BufferUsages::COPY_DST,
-    });
+    let params_buffer_odd = render_device.create_buffer_with_data(
+        &bevy::render::render_resource::BufferInitDescriptor {
+            label: Some("lbm_params_buffer_odd"),
+            contents: bytemuck::bytes_of(&*params),
+            usage: bevy::render::render_resource::BufferUsages::UNIFORM
+                | bevy::render::render_resource::BufferUsages::COPY_DST,
+        },
+    );
 
     let odd = render_device.create_bind_group(
         "lbm_bind_group_odd",
@@ -383,18 +391,16 @@ impl render_graph::Node for LbmNode {
         let workgroups = GRID_SIZE / WORKGROUP_SIZE;
 
         // Initialization pass (run once)
-        if !self.initialized {
-            if let Some(init_pipeline) = pipeline_cache.get_compute_pipeline(pipeline.init_pipeline)
-            {
-                if let Some(bind_group) = &bind_groups.even {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor::default());
-                    pass.set_bind_group(0, bind_group, &[]);
-                    pass.set_pipeline(init_pipeline);
-                    pass.dispatch_workgroups(workgroups, workgroups, workgroups);
-                }
-            }
+        if !self.initialized
+            && let Some(init_pipeline) = pipeline_cache.get_compute_pipeline(pipeline.init_pipeline)
+            && let Some(bind_group) = &bind_groups.even
+        {
+            let mut pass = render_context
+                .command_encoder()
+                .begin_compute_pass(&ComputePassDescriptor::default());
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.set_pipeline(init_pipeline);
+            pass.dispatch_workgroups(workgroups, workgroups, workgroups);
         }
 
         // Stream and collide pass
@@ -402,7 +408,7 @@ impl render_graph::Node for LbmNode {
             pipeline_cache.get_compute_pipeline(pipeline.stream_collide_pipeline)
         {
             // Select bind group based on step parity
-            let bind_group = if self.step % 2 == 0 {
+            let bind_group = if self.step.is_multiple_of(2) {
                 &bind_groups.even
             } else {
                 &bind_groups.odd
@@ -487,10 +493,7 @@ struct OrbitCamera {
     phi: f32,   // Vertical angle
 }
 
-fn rotate_camera(
-    time: Res<Time>,
-    mut query: Query<(&mut Transform, &mut OrbitCamera)>,
-) {
+fn rotate_camera(time: Res<Time>, mut query: Query<(&mut Transform, &mut OrbitCamera)>) {
     for (mut transform, mut orbit) in query.iter_mut() {
         // Auto-rotate slowly
         orbit.theta += time.delta_secs() * 0.1;
@@ -504,10 +507,7 @@ fn rotate_camera(
     }
 }
 
-fn handle_input(
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mut query: Query<&mut OrbitCamera>,
-) {
+fn handle_input(keyboard: Res<ButtonInput<KeyCode>>, mut query: Query<&mut OrbitCamera>) {
     for mut orbit in query.iter_mut() {
         if keyboard.pressed(KeyCode::ArrowLeft) {
             orbit.theta -= 0.02;
