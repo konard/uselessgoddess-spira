@@ -1,7 +1,18 @@
 //! Blazing LBM fluid simulation for dental sinus rinsing.
 //!
 //! This application simulates saline solution flow through a maxillary sinus cavity
-//! using the Lattice Boltzmann Method (LBM) D3Q19 with Free Surface approximation.
+//! using the Lattice Boltzmann Method (LBM) D3Q19.
+//!
+//! Controls:
+//! - WASD: Move camera horizontally
+//! - Q/E: Move camera up/down
+//! - Arrow keys: Rotate camera
+//! - R: Restart simulation
+//! - Space: Toggle pause
+//! - 1: Density coloring mode
+//! - 2: Velocity/speed coloring mode
+//! - 3: Pressure coloring mode
+//! - +/-: Adjust injection rate
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -25,16 +36,17 @@ use std::borrow::Cow;
 // ============================================================================
 
 /// Grid size for the MVP simulation (can be scaled up later for 512^3 sparse)
-const GRID_SIZE: u32 = 128;
+const GRID_SIZE: u32 = 64; // Reduced for better stability and performance
 /// Workgroup size for compute shaders (8x8x8 = 512 threads per workgroup)
 const WORKGROUP_SIZE: u32 = 8;
-/// Display window scale factor
-const DISPLAY_FACTOR: u32 = 4;
+/// Voxel rendering size
+const VOXEL_SIZE: f32 = 1.0;
+/// Density threshold for rendering
+const DENSITY_THRESHOLD: f32 = 0.5;
 
 /// Shader asset paths
 const LBM_SHADER_PATH: &str = "shaders/lbm.wgsl";
 const INJECT_SHADER_PATH: &str = "shaders/inject.wgsl";
-const RENDER_SHADER_PATH: &str = "shaders/render.wgsl";
 
 // ============================================================================
 // Voxel World Trait (for future DICOM loader extensibility)
@@ -50,6 +62,18 @@ pub trait VoxelDataProvider: Send + Sync + 'static {
     /// Returns the signed distance field value at (x, y, z)
     /// Negative inside bone, positive inside air/cavity
     fn sdf(&self, x: u32, y: u32, z: u32) -> f32;
+}
+
+// ============================================================================
+// Coloring Mode
+// ============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum ColoringMode {
+    #[default]
+    Density,
+    Velocity,
+    Pressure,
 }
 
 // ============================================================================
@@ -90,7 +114,7 @@ impl VoxelWorld {
                     let dist_from_center = (pos - center).length();
 
                     // Add noise for organic shape variation
-                    let noise = Self::simple_noise(pos * 0.1) * 5.0;
+                    let noise = Self::simple_noise(pos * 0.1) * 3.0;
 
                     // SDF: positive inside cavity, negative in bone
                     let sdf = if dist_from_center < inner_radius + noise {
@@ -174,12 +198,12 @@ impl Default for FluidParams {
         let center = grid_size as f32 * 0.5;
 
         Self {
-            viscosity: 0.02,
-            gravity: Vec3::new(0.0, -0.003, 0.0), // Strong downward gravity
+            viscosity: 0.1, // Higher viscosity for stability
+            gravity: Vec3::new(0.0, -0.001, 0.0), // Gentler gravity
             // Injection at the top of the cavity
-            injection_point: Vec3::new(center, center + 20.0, center),
-            injection_velocity: Vec3::new(0.0, -0.1, 0.0),
-            injection_rate: 0.5,
+            injection_point: Vec3::new(center, center + 10.0, center),
+            injection_velocity: Vec3::new(0.0, -0.05, 0.0),
+            injection_rate: 0.1, // Lower injection rate for stability
             dt: 1.0,
             frame: 0,
             grid_size,
@@ -187,44 +211,31 @@ impl Default for FluidParams {
     }
 }
 
-/// Resource for render parameters (camera, lighting)
-#[derive(Resource, Clone, Copy, ExtractResource, ShaderType, Pod, Zeroable)]
-#[repr(C)]
-pub struct RenderParams {
-    /// Camera position in world space
-    pub camera_pos: Vec3,
-    pub _pad0: f32,
-    /// Camera target (look-at point)
-    pub camera_target: Vec3,
-    pub _pad1: f32,
-    /// Light direction (normalized)
-    pub light_dir: Vec3,
-    pub _pad2: f32,
-    /// Grid size for ray calculations
-    pub grid_size: f32,
-    /// Density threshold for isosurface
-    pub density_threshold: f32,
-    /// Water color tint
-    pub water_color: Vec3,
-    pub _pad3: f32,
+/// Simulation state resource
+#[derive(Resource, Default)]
+pub struct SimulationState {
+    pub paused: bool,
+    pub needs_restart: bool,
+    pub coloring_mode: ColoringMode,
 }
 
-impl Default for RenderParams {
+/// Camera controller state
+#[derive(Resource)]
+pub struct CameraController {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub target: Vec3,
+}
+
+impl Default for CameraController {
     fn default() -> Self {
         let grid_size = GRID_SIZE as f32;
-        let center = grid_size * 0.5;
-
         Self {
-            camera_pos: Vec3::new(center * 2.5, center * 1.5, center * 2.5),
-            _pad0: 0.0,
-            camera_target: Vec3::new(center, center, center),
-            _pad1: 0.0,
-            light_dir: Vec3::new(0.5, 1.0, 0.3).normalize(),
-            _pad2: 0.0,
-            grid_size,
-            density_threshold: 0.3,
-            water_color: Vec3::new(0.2, 0.5, 0.9),
-            _pad3: 0.0,
+            yaw: 0.5,
+            pitch: 0.3,
+            distance: grid_size * 2.5,
+            target: Vec3::splat(grid_size * 0.5),
         }
     }
 }
@@ -248,8 +259,6 @@ pub struct LbmTextures {
     pub velocity: Handle<Image>,
     /// Boundary/SDF texture (solid voxels)
     pub boundaries: Handle<Image>,
-    /// Output render target for raymarching
-    pub render_target: Handle<Image>,
 }
 
 /// Resource holding bind groups for the compute passes
@@ -259,8 +268,33 @@ pub struct LbmBindGroups {
     pub lbm_step: [BindGroup; 2],
     /// Bind group for injection
     pub injection: BindGroup,
-    /// Bind group for rendering
-    pub render: BindGroup,
+}
+
+// ============================================================================
+// Fluid Mesh Components
+// ============================================================================
+
+/// Marker component for fluid voxel entities
+#[derive(Component)]
+pub struct FluidVoxel {
+    pub grid_pos: UVec3,
+}
+
+/// Marker component for bone/boundary voxel entities
+#[derive(Component)]
+pub struct BoneVoxel;
+
+/// Component to track fluid visualization data
+#[derive(Resource, Default)]
+pub struct FluidVisualization {
+    /// Density values extracted from GPU (for CPU-side visualization)
+    pub density_data: Vec<f32>,
+    /// Velocity data extracted from GPU
+    pub velocity_data: Vec<Vec4>,
+    /// Needs GPU readback
+    pub needs_update: bool,
+    /// Frame counter for throttling updates
+    pub update_counter: u32,
 }
 
 // ============================================================================
@@ -271,11 +305,9 @@ pub struct LbmBindGroups {
 pub struct FluidSimPipeline {
     pub bind_group_layout_lbm: BindGroupLayout,
     pub bind_group_layout_inject: BindGroupLayout,
-    pub bind_group_layout_render: BindGroupLayout,
     pub init_pipeline: CachedComputePipelineId,
     pub collide_stream_pipeline: CachedComputePipelineId,
     pub injection_pipeline: CachedComputePipelineId,
-    pub render_pipeline: CachedComputePipelineId,
 }
 
 // ============================================================================
@@ -294,7 +326,6 @@ impl Plugin for SinusFluidPlugin {
         app.add_plugins((
             ExtractResourcePlugin::<LbmTextures>::default(),
             ExtractResourcePlugin::<FluidParams>::default(),
-            ExtractResourcePlugin::<RenderParams>::default(),
         ));
 
         // Setup render app
@@ -371,30 +402,9 @@ fn init_fluid_pipeline(
         ),
     );
 
-    // Render bind group layout
-    let bind_group_layout_render = render_device.create_bind_group_layout(
-        "Render_BindGroupLayout",
-        &BindGroupLayoutEntries::sequential(
-            ShaderStages::COMPUTE,
-            (
-                // Density texture (read)
-                texture_storage_3d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
-                // Velocity texture (read)
-                texture_storage_3d(TextureFormat::Rgba32Float, StorageTextureAccess::ReadOnly),
-                // Boundaries texture (read)
-                texture_storage_3d(TextureFormat::R32Float, StorageTextureAccess::ReadOnly),
-                // Output image (write)
-                texture_storage_2d(TextureFormat::Rgba32Float, StorageTextureAccess::WriteOnly),
-                // Render params uniform
-                uniform_buffer::<RenderParams>(false),
-            ),
-        ),
-    );
-
     // Load shaders via asset server
     let lbm_shader = asset_server.load(LBM_SHADER_PATH);
     let inject_shader = asset_server.load(INJECT_SHADER_PATH);
-    let render_shader = asset_server.load(RENDER_SHADER_PATH);
 
     // Create pipelines
     let init_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
@@ -427,24 +437,12 @@ fn init_fluid_pipeline(
         zero_initialize_workgroup_memory: true,
     });
 
-    let render_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-        label: Some(Cow::from("Render_Pipeline")),
-        layout: vec![bind_group_layout_render.clone()],
-        push_constant_ranges: vec![],
-        shader: render_shader,
-        shader_defs: vec![],
-        entry_point: Some(Cow::from("raymarch")),
-        zero_initialize_workgroup_memory: true,
-    });
-
     commands.insert_resource(FluidSimPipeline {
         bind_group_layout_lbm,
         bind_group_layout_inject,
-        bind_group_layout_render,
         init_pipeline,
         collide_stream_pipeline,
         injection_pipeline,
-        render_pipeline,
     });
 }
 
@@ -458,7 +456,6 @@ fn prepare_bind_groups(
     gpu_images: Res<RenderAssets<GpuImage>>,
     lbm_textures: Res<LbmTextures>,
     fluid_params: Res<FluidParams>,
-    render_params: Res<RenderParams>,
     render_device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
 ) {
@@ -490,17 +487,10 @@ fn prepare_bind_groups(
         Some(img) => img,
         None => return,
     };
-    let render_target = match gpu_images.get(&lbm_textures.render_target) {
-        Some(img) => img,
-        None => return,
-    };
 
     // Create uniform buffers
     let mut fluid_uniform = UniformBuffer::from(*fluid_params);
     fluid_uniform.write_buffer(&render_device, &queue);
-
-    let mut render_uniform = UniformBuffer::from(*render_params);
-    render_uniform.write_buffer(&render_device, &queue);
 
     // LBM step bind groups (A->B and B->A)
     let lbm_bind_group_0 = render_device.create_bind_group(
@@ -551,7 +541,8 @@ fn prepare_bind_groups(
         )),
     );
 
-    // Injection bind group (uses current output distributions)
+    // Injection bind group (uses current output distributions based on frame)
+    // We'll use dist_b for injection after A->B step on even frames
     let injection_bind_group = render_device.create_bind_group(
         Some("Injection_BindGroup"),
         &pipeline.bind_group_layout_inject,
@@ -565,23 +556,9 @@ fn prepare_bind_groups(
         )),
     );
 
-    // Render bind group
-    let render_bind_group = render_device.create_bind_group(
-        Some("Render_BindGroup"),
-        &pipeline.bind_group_layout_render,
-        &BindGroupEntries::sequential((
-            &density.texture_view,
-            &velocity.texture_view,
-            &boundaries.texture_view,
-            &render_target.texture_view,
-            &render_uniform,
-        )),
-    );
-
     commands.insert_resource(LbmBindGroups {
         lbm_step: [lbm_bind_group_0, lbm_bind_group_1],
         injection: injection_bind_group,
-        render: render_bind_group,
     });
 }
 
@@ -642,22 +619,15 @@ impl render_graph::Node for FluidSimNode {
                     pipeline_cache.get_compute_pipeline_state(pipeline.injection_pipeline),
                     CachedPipelineState::Ok(_)
                 );
-                let render_ready = matches!(
-                    pipeline_cache.get_compute_pipeline_state(pipeline.render_pipeline),
-                    CachedPipelineState::Ok(_)
-                );
 
-                if init_ready && collide_ready && inject_ready && render_ready {
+                if init_ready && collide_ready && inject_ready {
                     self.state = FluidSimState::Running(0);
                 }
             }
-            FluidSimState::Running(0) => {
-                self.state = FluidSimState::Running(1);
+            FluidSimState::Running(idx) => {
+                // Alternate between 0 and 1 for ping-pong
+                self.state = FluidSimState::Running(1 - idx);
             }
-            FluidSimState::Running(1) => {
-                self.state = FluidSimState::Running(0);
-            }
-            FluidSimState::Running(_) => unreachable!(),
         }
     }
 
@@ -712,11 +682,6 @@ impl render_graph::Node for FluidSimNode {
                         Some(p) => p,
                         None => return Ok(()),
                     };
-                let render_pipeline =
-                    match pipeline_cache.get_compute_pipeline(pipeline.render_pipeline) {
-                        Some(p) => p,
-                        None => return Ok(()),
-                    };
 
                 // LBM Collide + Stream step
                 {
@@ -741,23 +706,8 @@ impl render_graph::Node for FluidSimNode {
                         });
                     pass.set_bind_group(0, &bind_groups.injection, &[]);
                     pass.set_pipeline(inject_pipeline);
-                    // Only dispatch a small region around injection point
+                    // Dispatch a small region around injection point
                     pass.dispatch_workgroups(2, 2, 2);
-                }
-
-                // Raymarching render step
-                {
-                    let mut pass = render_context
-                        .command_encoder()
-                        .begin_compute_pass(&ComputePassDescriptor {
-                            label: Some("Raymarching"),
-                            timestamp_writes: None,
-                        });
-                    pass.set_bind_group(0, &bind_groups.render, &[]);
-                    pass.set_pipeline(render_pipeline);
-                    // Render to window-sized output
-                    let render_workgroups = (GRID_SIZE * DISPLAY_FACTOR) / WORKGROUP_SIZE;
-                    pass.dispatch_workgroups(render_workgroups, render_workgroups, 1);
                 }
             }
         }
@@ -770,7 +720,12 @@ impl render_graph::Node for FluidSimNode {
 // Setup Systems
 // ============================================================================
 
-fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+fn setup(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
     // Create the voxel world
     let voxel_world = VoxelWorld::default();
 
@@ -809,10 +764,10 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureDimension::D3,
         &[0u8; 4], // R32Float = 4 bytes
         TextureFormat::R32Float,
-        RenderAssetUsages::RENDER_WORLD,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
     density_image.texture_descriptor.usage =
-        TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+        TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
     let density = images.add(density_image);
 
     // Velocity texture
@@ -825,10 +780,10 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureDimension::D3,
         &[0u8; 16], // RGBA32Float for vec3 + padding
         TextureFormat::Rgba32Float,
-        RenderAssetUsages::RENDER_WORLD,
+        RenderAssetUsages::RENDER_WORLD | RenderAssetUsages::MAIN_WORLD,
     );
     velocity_image.texture_descriptor.usage =
-        TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
+        TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | TextureUsages::COPY_SRC;
     let velocity = images.add(velocity_image);
 
     // Boundaries texture (from voxel world SDF)
@@ -853,97 +808,430 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
         TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
     let boundaries = images.add(boundaries_image);
 
-    // Render target (2D)
-    let window_size = GRID_SIZE * DISPLAY_FACTOR;
-    let mut render_target_image = Image::new_fill(
-        Extent3d {
-            width: window_size,
-            height: window_size,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        &[0u8; 16],
-        TextureFormat::Rgba32Float,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    render_target_image.texture_descriptor.usage =
-        TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST;
-    let render_target = images.add(render_target_image);
-
-    // Insert resources
-    commands.insert_resource(voxel_world);
-    commands.insert_resource(FluidParams::default());
-    commands.insert_resource(RenderParams::default());
+    // Insert LBM textures resource
     commands.insert_resource(LbmTextures {
         distributions_a,
         distributions_b,
-        density,
-        velocity,
+        density: density.clone(),
+        velocity: velocity.clone(),
         boundaries,
-        render_target: render_target.clone(),
     });
 
-    // Spawn sprite to display the render target
+    // Insert other resources
+    commands.insert_resource(voxel_world.clone());
+    commands.insert_resource(FluidParams::default());
+    commands.insert_resource(SimulationState::default());
+    commands.insert_resource(CameraController::default());
+    commands.insert_resource(FluidVisualization::default());
+
+    // Create mesh for fluid voxels (small cube)
+    let cube_mesh = meshes.add(Cuboid::new(VOXEL_SIZE * 0.8, VOXEL_SIZE * 0.8, VOXEL_SIZE * 0.8));
+
+    // Create materials for fluid visualization
+    let water_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.2, 0.5, 0.9, 0.7),
+        alpha_mode: AlphaMode::Blend,
+        metallic: 0.0,
+        reflectance: 0.5,
+        perceptual_roughness: 0.1,
+        ..default()
+    });
+
+    // Create bone material (semi-transparent)
+    let bone_material = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.9, 0.85, 0.75, 0.3),
+        alpha_mode: AlphaMode::Blend,
+        metallic: 0.0,
+        reflectance: 0.2,
+        perceptual_roughness: 0.8,
+        ..default()
+    });
+
+    // Store materials as resources
+    commands.insert_resource(FluidMaterials {
+        water: water_material.clone(),
+        bone: bone_material.clone(),
+        cube_mesh: cube_mesh.clone(),
+    });
+
+    // Spawn boundary visualization (sparse - only surface voxels)
+    let grid_size = GRID_SIZE as i32;
+    let center = grid_size as f32 * 0.5;
+
+    // Sample boundary for visualization (every N voxels for performance)
+    let sample_step = 4;
+    for z in (0..grid_size).step_by(sample_step) {
+        for y in (0..grid_size).step_by(sample_step) {
+            for x in (0..grid_size).step_by(sample_step) {
+                let sdf = voxel_world.get_sdf(x as u32, y as u32, z as u32);
+                // Only render near-surface bone voxels
+                if sdf < 0.0 && sdf > -5.0 {
+                    commands.spawn((
+                        Mesh3d(cube_mesh.clone()),
+                        MeshMaterial3d(bone_material.clone()),
+                        Transform::from_translation(Vec3::new(
+                            x as f32 - center + 0.5,
+                            y as f32 - center + 0.5,
+                            z as f32 - center + 0.5,
+                        )).with_scale(Vec3::splat(sample_step as f32)),
+                        BoneVoxel,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Spawn 3D camera
+    let camera_controller = CameraController::default();
+    let camera_pos = calculate_camera_position(&camera_controller);
+
     commands.spawn((
-        Sprite {
-            image: render_target,
-            custom_size: Some(Vec2::splat(window_size as f32)),
-            ..default()
-        },
-        Transform::default(),
+        Camera3d::default(),
+        Transform::from_translation(camera_pos).looking_at(camera_controller.target - Vec3::splat(center), Vec3::Y),
     ));
 
-    // Spawn camera
-    commands.spawn(Camera2d);
+    // Spawn directional light
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 10000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.5, 0.5, 0.0)),
+    ));
+
+    // Spawn ambient light
+    commands.insert_resource(AmbientLight {
+        color: Color::WHITE,
+        brightness: 500.0,
+        affects_lightmapped_meshes: false,
+    });
+
+    // Spawn UI text for controls
+    commands.spawn((
+        Text::new("Controls:\nWASD - Move camera\nQ/E - Up/Down\nArrows - Rotate\nR - Restart\nSpace - Pause\n1/2/3 - Color mode\n+/- Injection rate"),
+        TextFont {
+            font_size: 16.0,
+            ..default()
+        },
+        TextColor(Color::WHITE),
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(10.0),
+            left: Val::Px(10.0),
+            ..default()
+        },
+    ));
+}
+
+/// Materials for fluid rendering
+#[derive(Resource)]
+pub struct FluidMaterials {
+    pub water: Handle<StandardMaterial>,
+    pub bone: Handle<StandardMaterial>,
+    pub cube_mesh: Handle<Mesh>,
+}
+
+fn calculate_camera_position(controller: &CameraController) -> Vec3 {
+    let x = controller.distance * controller.yaw.cos() * controller.pitch.cos();
+    let y = controller.distance * controller.pitch.sin();
+    let z = controller.distance * controller.yaw.sin() * controller.pitch.cos();
+    controller.target + Vec3::new(x, y, z)
 }
 
 /// Update fluid params each frame
-fn update_simulation(mut params: ResMut<FluidParams>, time: Res<Time>) {
+fn update_simulation(
+    mut params: ResMut<FluidParams>,
+    sim_state: Res<SimulationState>,
+    time: Res<Time>,
+) {
+    if sim_state.paused {
+        return;
+    }
+
     params.frame = params.frame.wrapping_add(1);
 
-    // Optionally animate injection point or other params
+    // Gentle wobble on injection point for natural flow
     let t = time.elapsed_secs();
-    let wobble = (t * 2.0).sin() * 2.0;
-    params.injection_point.x = (GRID_SIZE as f32 * 0.5) + wobble;
+    let wobble = (t * 1.5).sin() * 1.0;
+    let center = GRID_SIZE as f32 * 0.5;
+    params.injection_point.x = center + wobble;
 }
 
 /// Camera control system
 fn camera_control(
-    mut render_params: ResMut<RenderParams>,
+    mut camera_controller: ResMut<CameraController>,
+    mut camera_query: Query<&mut Transform, With<Camera3d>>,
     time: Res<Time>,
     keyboard: Res<ButtonInput<KeyCode>>,
 ) {
-    let t = time.elapsed_secs();
+    let dt = time.delta_secs();
+    let move_speed = 50.0 * dt;
+    let rotate_speed = 1.5 * dt;
     let center = GRID_SIZE as f32 * 0.5;
-    let radius = center * 2.0;
 
-    // Auto-rotate camera around the volume
-    let angle = t * 0.2;
-    render_params.camera_pos = Vec3::new(
-        center + angle.cos() * radius,
-        center * 1.2,
-        center + angle.sin() * radius,
-    );
+    // Rotation
+    if keyboard.pressed(KeyCode::ArrowLeft) {
+        camera_controller.yaw += rotate_speed;
+    }
+    if keyboard.pressed(KeyCode::ArrowRight) {
+        camera_controller.yaw -= rotate_speed;
+    }
+    if keyboard.pressed(KeyCode::ArrowUp) {
+        camera_controller.pitch = (camera_controller.pitch + rotate_speed).min(1.4);
+    }
+    if keyboard.pressed(KeyCode::ArrowDown) {
+        camera_controller.pitch = (camera_controller.pitch - rotate_speed).max(-1.4);
+    }
 
-    // Manual camera control
-    let speed = 50.0 * time.delta_secs();
+    // Movement (relative to camera orientation)
+    let forward = Vec3::new(
+        -camera_controller.yaw.sin(),
+        0.0,
+        -camera_controller.yaw.cos(),
+    ).normalize();
+    let right = Vec3::new(forward.z, 0.0, -forward.x);
+
     if keyboard.pressed(KeyCode::KeyW) {
-        render_params.camera_pos.z -= speed;
+        camera_controller.target += forward * move_speed;
     }
     if keyboard.pressed(KeyCode::KeyS) {
-        render_params.camera_pos.z += speed;
+        camera_controller.target -= forward * move_speed;
     }
     if keyboard.pressed(KeyCode::KeyA) {
-        render_params.camera_pos.x -= speed;
+        camera_controller.target -= right * move_speed;
     }
     if keyboard.pressed(KeyCode::KeyD) {
-        render_params.camera_pos.x += speed;
+        camera_controller.target += right * move_speed;
     }
     if keyboard.pressed(KeyCode::KeyQ) {
-        render_params.camera_pos.y -= speed;
+        camera_controller.target.y -= move_speed;
     }
     if keyboard.pressed(KeyCode::KeyE) {
-        render_params.camera_pos.y += speed;
+        camera_controller.target.y += move_speed;
+    }
+
+    // Zoom
+    if keyboard.pressed(KeyCode::Minus) || keyboard.pressed(KeyCode::NumpadSubtract) {
+        camera_controller.distance *= 1.0 + dt;
+    }
+    if keyboard.pressed(KeyCode::Equal) || keyboard.pressed(KeyCode::NumpadAdd) {
+        camera_controller.distance *= 1.0 - dt;
+    }
+    camera_controller.distance = camera_controller.distance.clamp(20.0, 500.0);
+
+    // Update camera transform
+    let camera_pos = calculate_camera_position(&camera_controller);
+    for mut transform in camera_query.iter_mut() {
+        *transform = Transform::from_translation(camera_pos)
+            .looking_at(camera_controller.target - Vec3::splat(center), Vec3::Y);
+    }
+}
+
+/// Handle keyboard input for simulation controls
+fn handle_input(
+    mut sim_state: ResMut<SimulationState>,
+    mut params: ResMut<FluidParams>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+) {
+    // Pause/unpause
+    if keyboard.just_pressed(KeyCode::Space) {
+        sim_state.paused = !sim_state.paused;
+    }
+
+    // Restart simulation
+    if keyboard.just_pressed(KeyCode::KeyR) {
+        sim_state.needs_restart = true;
+        params.frame = 0;
+    }
+
+    // Coloring modes
+    if keyboard.just_pressed(KeyCode::Digit1) {
+        sim_state.coloring_mode = ColoringMode::Density;
+    }
+    if keyboard.just_pressed(KeyCode::Digit2) {
+        sim_state.coloring_mode = ColoringMode::Velocity;
+    }
+    if keyboard.just_pressed(KeyCode::Digit3) {
+        sim_state.coloring_mode = ColoringMode::Pressure;
+    }
+
+    // Adjust injection rate
+    if keyboard.pressed(KeyCode::BracketRight) {
+        params.injection_rate = (params.injection_rate + 0.01).min(1.0);
+    }
+    if keyboard.pressed(KeyCode::BracketLeft) {
+        params.injection_rate = (params.injection_rate - 0.01).max(0.01);
+    }
+}
+
+/// Update fluid visualization by reading density texture
+fn update_fluid_visualization(
+    mut commands: Commands,
+    mut fluid_vis: ResMut<FluidVisualization>,
+    images: Res<Assets<Image>>,
+    lbm_textures: Res<LbmTextures>,
+    sim_state: Res<SimulationState>,
+    voxel_world: Res<VoxelWorld>,
+    materials: Res<FluidMaterials>,
+    mut mat_assets: ResMut<Assets<StandardMaterial>>,
+    existing_voxels: Query<Entity, With<FluidVoxel>>,
+) {
+    // Throttle updates for performance (every 10 frames)
+    fluid_vis.update_counter += 1;
+    if fluid_vis.update_counter % 10 != 0 {
+        return;
+    }
+
+    // Read density data from the image asset
+    let density_image = match images.get(&lbm_textures.density) {
+        Some(img) => img,
+        None => return,
+    };
+
+    let velocity_image = match images.get(&lbm_textures.velocity) {
+        Some(img) => img,
+        None => return,
+    };
+
+    // Clear existing fluid voxels
+    for entity in existing_voxels.iter() {
+        commands.entity(entity).despawn();
+    }
+
+    let grid_size = GRID_SIZE as usize;
+    let center = GRID_SIZE as f32 * 0.5;
+
+    // Parse density and velocity data - in Bevy 0.17, data is Option<Vec<u8>>
+    let density_bytes = match &density_image.data {
+        Some(data) => data,
+        None => return,
+    };
+    let velocity_bytes = match &velocity_image.data {
+        Some(data) => data,
+        None => return,
+    };
+
+    // Sample grid for visualization (every 2 voxels for performance)
+    let sample_step = 2;
+
+    for z in (0..grid_size).step_by(sample_step) {
+        for y in (0..grid_size).step_by(sample_step) {
+            for x in (0..grid_size).step_by(sample_step) {
+                let idx = z * grid_size * grid_size + y * grid_size + x;
+
+                // Check if this is inside the cavity (not bone)
+                let sdf = voxel_world.get_sdf(x as u32, y as u32, z as u32);
+                if sdf <= 0.0 {
+                    continue; // Skip bone voxels
+                }
+
+                // Read density (R32Float = 4 bytes per voxel)
+                let density_offset = idx * 4;
+                if density_offset + 4 > density_bytes.len() {
+                    continue;
+                }
+
+                let density = f32::from_le_bytes([
+                    density_bytes[density_offset],
+                    density_bytes[density_offset + 1],
+                    density_bytes[density_offset + 2],
+                    density_bytes[density_offset + 3],
+                ]);
+
+                // Only render voxels with significant density
+                if density < DENSITY_THRESHOLD {
+                    continue;
+                }
+
+                // Read velocity (RGBA32Float = 16 bytes per voxel)
+                let velocity_offset = idx * 16;
+                let velocity = if velocity_offset + 16 <= velocity_bytes.len() {
+                    Vec3::new(
+                        f32::from_le_bytes([
+                            velocity_bytes[velocity_offset],
+                            velocity_bytes[velocity_offset + 1],
+                            velocity_bytes[velocity_offset + 2],
+                            velocity_bytes[velocity_offset + 3],
+                        ]),
+                        f32::from_le_bytes([
+                            velocity_bytes[velocity_offset + 4],
+                            velocity_bytes[velocity_offset + 5],
+                            velocity_bytes[velocity_offset + 6],
+                            velocity_bytes[velocity_offset + 7],
+                        ]),
+                        f32::from_le_bytes([
+                            velocity_bytes[velocity_offset + 8],
+                            velocity_bytes[velocity_offset + 9],
+                            velocity_bytes[velocity_offset + 10],
+                            velocity_bytes[velocity_offset + 11],
+                        ]),
+                    )
+                } else {
+                    Vec3::ZERO
+                };
+
+                // Calculate color based on mode
+                let color = match sim_state.coloring_mode {
+                    ColoringMode::Density => {
+                        // Blue to white based on density
+                        let t = ((density - DENSITY_THRESHOLD) / (2.0 - DENSITY_THRESHOLD)).clamp(0.0, 1.0);
+                        Color::srgba(
+                            0.2 + t * 0.8,
+                            0.5 + t * 0.5,
+                            0.9,
+                            0.6 + t * 0.3,
+                        )
+                    }
+                    ColoringMode::Velocity => {
+                        // Color based on velocity magnitude (cool to warm)
+                        let speed = velocity.length();
+                        let t = (speed * 20.0).clamp(0.0, 1.0);
+                        Color::srgba(
+                            t,
+                            0.3 + (1.0 - t) * 0.4,
+                            1.0 - t,
+                            0.6 + t * 0.3,
+                        )
+                    }
+                    ColoringMode::Pressure => {
+                        // Pressure ~ density in LBM (cs^2 * rho)
+                        let pressure = density / 3.0; // cs^2 = 1/3
+                        let t = ((pressure - 0.3) / 0.4).clamp(0.0, 1.0);
+                        Color::srgba(
+                            0.2 + t * 0.7,
+                            0.8 - t * 0.5,
+                            0.3 + (1.0 - t) * 0.5,
+                            0.6 + t * 0.3,
+                        )
+                    }
+                };
+
+                // Create material for this voxel
+                let material = mat_assets.add(StandardMaterial {
+                    base_color: color,
+                    alpha_mode: AlphaMode::Blend,
+                    metallic: 0.0,
+                    reflectance: 0.5,
+                    perceptual_roughness: 0.1,
+                    ..default()
+                });
+
+                // Spawn fluid voxel
+                commands.spawn((
+                    Mesh3d(materials.cube_mesh.clone()),
+                    MeshMaterial3d(material),
+                    Transform::from_translation(Vec3::new(
+                        x as f32 - center + 0.5,
+                        y as f32 - center + 0.5,
+                        z as f32 - center + 0.5,
+                    )).with_scale(Vec3::splat(sample_step as f32 * 0.9)),
+                    FluidVoxel {
+                        grid_pos: UVec3::new(x as u32, y as u32, z as u32),
+                    },
+                ));
+            }
+        }
     }
 }
 
@@ -953,15 +1241,12 @@ fn camera_control(
 
 fn main() {
     App::new()
-        .insert_resource(ClearColor(Color::srgb(0.1, 0.1, 0.15)))
+        .insert_resource(ClearColor(Color::srgb(0.05, 0.05, 0.1)))
         .add_plugins((
             DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
                     title: "Spira - Dental Fluid Simulation".to_string(),
-                    resolution: bevy::window::WindowResolution::new(
-                        GRID_SIZE * DISPLAY_FACTOR,
-                        GRID_SIZE * DISPLAY_FACTOR,
-                    ),
+                    resolution: bevy::window::WindowResolution::new(1024, 768),
                     ..default()
                 }),
                 ..default()
@@ -969,6 +1254,11 @@ fn main() {
             SinusFluidPlugin,
         ))
         .add_systems(Startup, setup)
-        .add_systems(Update, (update_simulation, camera_control))
+        .add_systems(Update, (
+            update_simulation,
+            camera_control,
+            handle_input,
+            update_fluid_visualization,
+        ))
         .run();
 }

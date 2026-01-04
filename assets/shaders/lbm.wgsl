@@ -1,5 +1,5 @@
 // Lattice Boltzmann Method (LBM) D3Q19 Compute Shader
-// For dental sinus fluid simulation with Free Surface approximation
+// For dental sinus fluid simulation
 //
 // D3Q19 uses 19 velocity directions in 3D:
 // - 1 rest velocity (0,0,0)
@@ -13,7 +13,6 @@
 const WORKGROUP_SIZE: u32 = 8u;
 
 // D3Q19 velocity directions
-// Packed into arrays for efficient access
 const E_X: array<i32, 19> = array<i32, 19>(
     0,  1, -1,  0,  0,  0,  0,  1, -1,  1, -1,  1, -1,  1, -1,  0,  0,  0,  0
 );
@@ -26,13 +25,13 @@ const E_Z: array<i32, 19> = array<i32, 19>(
 
 // D3Q19 weights
 const W: array<f32, 19> = array<f32, 19>(
-    1.0 / 3.0,                          // rest (0)
-    1.0 / 18.0, 1.0 / 18.0,             // +-x (1-2)
-    1.0 / 18.0, 1.0 / 18.0,             // +-y (3-4)
-    1.0 / 18.0, 1.0 / 18.0,             // +-z (5-6)
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,  // xy edges (7-10)
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0,  // xz edges (11-14)
-    1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0, 1.0 / 36.0   // yz edges (15-18)
+    0.333333333,  // rest (0)  = 1/3
+    0.055555556, 0.055555556,  // +-x (1-2)  = 1/18
+    0.055555556, 0.055555556,  // +-y (3-4)
+    0.055555556, 0.055555556,  // +-z (5-6)
+    0.027777778, 0.027777778, 0.027777778, 0.027777778,  // xy edges (7-10) = 1/36
+    0.027777778, 0.027777778, 0.027777778, 0.027777778,  // xz edges (11-14)
+    0.027777778, 0.027777778, 0.027777778, 0.027777778   // yz edges (15-18)
 );
 
 // Opposite direction indices for bounce-back
@@ -44,8 +43,9 @@ const OPP: array<u32, 19> = array<u32, 19>(
 );
 
 // Speed of sound squared (cs^2 = 1/3 for D3Q19)
-const CS2: f32 = 1.0 / 3.0;
-const CS4: f32 = 1.0 / 9.0;
+const CS2: f32 = 0.333333333;
+const INV_CS2: f32 = 3.0;
+const INV_2CS4: f32 = 4.5;
 
 // ============================================================================
 // Uniforms and Bindings
@@ -142,13 +142,17 @@ fn is_solid(pos: vec3<i32>) -> bool {
     return sdf < 0.0;
 }
 
-// Compute equilibrium distribution
+// Compute equilibrium distribution with improved numerical stability
 fn f_eq(i: u32, rho: f32, u: vec3<f32>) -> f32 {
     let e = get_e_f(i);
     let eu = dot(e, u);
     let u2 = dot(u, u);
 
-    return W[i] * rho * (1.0 + eu / CS2 + eu * eu / (2.0 * CS4) - u2 / (2.0 * CS2));
+    // Ensure stability by clamping velocity magnitude
+    let u2_clamped = min(u2, 0.1);
+
+    // f_eq = w_i * rho * (1 + e.u/cs^2 + (e.u)^2/(2*cs^4) - u^2/(2*cs^2))
+    return W[i] * rho * (1.0 + INV_CS2 * eu + INV_2CS4 * eu * eu - 1.5 * u2_clamped);
 }
 
 // ============================================================================
@@ -164,7 +168,7 @@ fn init(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Initialize to equilibrium with zero velocity and unit density
+    // Initialize to equilibrium with zero velocity
     // Only initialize fluid cells (not bone)
     let solid = is_solid(pos);
     let rho = select(1.0, 0.0, solid);
@@ -205,7 +209,6 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     if is_solid(pos) {
         textureStore(density_out, pos, vec4<f32>(0.0));
         textureStore(velocity_out, pos, vec4<f32>(0.0));
-        // Store zero distributions
         textureStore(dist_out_0, pos, vec4<f32>(0.0));
         textureStore(dist_out_1, pos, vec4<f32>(0.0));
         textureStore(dist_out_2, pos, vec4<f32>(0.0));
@@ -226,7 +229,7 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
             // Bounce-back from solid: use opposite direction from current cell
             f[i] = load_f(pos, OPP[i]);
         } else if !in_bounds(neighbor_pos, size) {
-            // Outside boundary: use equilibrium
+            // Outside boundary: use equilibrium at rest
             f[i] = f_eq(i, 1.0, vec3<f32>(0.0));
         } else {
             // Normal streaming
@@ -245,20 +248,27 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
         momentum += f[i] * get_e_f(i);
     }
 
-    // Avoid division by zero
-    rho = max(rho, 0.001);
+    // Clamp density to valid range for stability
+    rho = clamp(rho, 0.5, 2.0);
     var u = momentum / rho;
 
-    // ========================================
-    // ADD GRAVITY FORCE (Guo forcing scheme)
-    // ========================================
-    let force = params.gravity * rho;
-    u += force * 0.5 / rho; // Half-step velocity correction
+    // Clamp velocity for stability
+    let speed = length(u);
+    if speed > 0.1 {
+        u = u * (0.1 / speed);
+    }
 
     // ========================================
-    // COLLISION: BGK with forcing
+    // ADD GRAVITY FORCE (simple forcing)
     // ========================================
-    // Relaxation time from viscosity: tau = 0.5 + viscosity / cs^2
+    let force = params.gravity;
+    u += force * 0.5;
+
+    // ========================================
+    // COLLISION: BGK relaxation
+    // ========================================
+    // Relaxation time: tau = 0.5 + 3 * viscosity
+    // Higher viscosity = higher tau = slower relaxation = more stable
     let tau = 0.5 + 3.0 * params.viscosity;
     let omega = 1.0 / tau;
 
@@ -266,17 +276,15 @@ fn collide_stream(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0u; i < 19u; i++) {
         let f_eq_i = f_eq(i, rho, u);
 
-        // BGK collision with forcing term (Guo scheme)
+        // BGK collision: f_out = f - omega * (f - f_eq)
+        f_out[i] = f[i] - omega * (f[i] - f_eq_i);
+
+        // Simple forcing term (Shan-Chen style)
         let e = get_e_f(i);
-        let eu = dot(e, u);
-        let force_term = (1.0 - 0.5 * omega) * W[i] * (
-            dot(e - u, force) / CS2 +
-            eu * dot(e, force) / CS4
-        );
+        let force_contrib = W[i] * INV_CS2 * dot(e, force);
+        f_out[i] += force_contrib;
 
-        f_out[i] = f[i] - omega * (f[i] - f_eq_i) + force_term;
-
-        // Ensure positivity (important for stability)
+        // Ensure positivity for stability
         f_out[i] = max(f_out[i], 0.0);
     }
 
