@@ -1,0 +1,26 @@
+[package]
+name = "spira"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = { version = "0.18", default-features = false, features = ["3d"] }
+
+[features]
+default = ["dev_native"]
+dev = [
+  "bevy/dynamic_linking",
+  "bevy/bevy_dev_tools",
+  "bevy/bevy_ui_debug",
+  "bevy/track_location",
+]
+dev_native = ["dev", "bevy/file_watcher", "bevy/embedded_watcher"]
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev.package.wgpu-types]
+debug-assertions = false
