@@ -2,9 +2,15 @@
 name = "spira"
 version = "0.1.0"
 edition = "2024"
+description = "GPU-accelerated Position Based Fluids simulation for Bevy"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/uselessgoddess/spira"
+keywords = ["bevy", "fluid", "simulation", "physics", "gpu"]
+categories = ["game-development", "simulation", "rendering"]
 
 [dependencies]
 bevy = { version = "0.18", default-features = false, features = ["3d"] }
+bytemuck = { version = "1.24", features = ["derive"] }
 
 [features]
 default = ["dev_native"]
